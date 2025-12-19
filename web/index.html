@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tron Signal</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="dot"></div>
+      <div>
+        <div class="title">Tron Signal Monitor</div>
+        <div class="sub">实时区块监听与交易信号广播</div>
+      </div>
+    </div>
+    <div class="actions">
+      <a class="link" href="/logout">Logout</a>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card">
+      <h2>系统状态</h2>
+      <div class="grid2">
+        <div class="kv">
+          <div class="k">监听状态</div>
+          <div class="v" id="sys-status">-</div>
+        </div>
+        <div class="kv">
+          <div class="k">重连次数</div>
+          <div class="v" id="ws-reconnect">0</div>
+        </div>
+        <div class="kv">
+          <div class="k">最新区块高度</div>
+          <div class="v" id="last-height">-</div>
+        </div>
+        <div class="kv">
+          <div class="k">最新区块时间</div>
+          <div class="v" id="last-time">-</div>
+        </div>
+      </div>
+      <div class="hint">状态每 3 秒轮询一次，同时也会通过 SSE 实时刷新。</div>
+    </section>
+
+    <section class="card">
+      <h2>TronGrid API Key（最多 3 个，保存后立即生效）</h2>
+      <div class="row">
+        <textarea id="apikeys" placeholder="每行一个 API Key"></textarea>
+      </div>
+      <div class="row">
+        <button id="btn-save-apikey">保存 API Keys</button>
+        <span class="msg" id="msg-apikey"></span>
+      </div>
+      <div class="hint">只有当 API Key ≥ 1 时，系统才允许进入区块监听阶段。</div>
+    </section>
+
+    <section class="card">
+      <h2>规则配置（全部使用滑块）</h2>
+
+      <div class="rule">
+        <div class="rule-head">
+          <label class="switch">
+            <input type="checkbox" id="on-enabled">
+            <span class="slider"></span>
+          </label>
+          <div class="rule-name">ON 规则</div>
+          <div class="rule-note">连续 ON 计数达到阈值触发 ON 信号</div>
+        </div>
+        <div class="rule-body">
+          <div class="range">
+            <div class="range-label">阈值</div>
+            <input type="range" id="on-threshold" min="0" max="20" value="5">
+            <div class="range-val" id="on-threshold-val">5</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rule">
+        <div class="rule-head">
+          <label class="switch">
+            <input type="checkbox" id="off-enabled">
+            <span class="slider"></span>
+          </label>
+          <div class="rule-name">OFF 规则</div>
+          <div class="rule-note">连续 OFF 计数达到阈值触发 OFF 信号</div>
+        </div>
+        <div class="rule-body">
+          <div class="range">
+            <div class="range-label">阈值</div>
+            <input type="range" id="off-threshold" min="0" max="20" value="5">
+            <div class="range-val" id="off-threshold-val">5</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rule">
+        <div class="rule-head">
+          <label class="switch">
+            <input type="checkbox" id="hit-enabled">
+            <span class="slider"></span>
+          </label>
+          <div class="rule-name">HIT 规则（t + x）</div>
+          <div class="rule-note">触发后在高度 t+x 的那一块做一次命中判定</div>
+        </div>
+        <div class="rule-body">
+          <div class="grid2">
+            <div class="range">
+              <div class="range-label">偏移 x（≥1）</div>
+              <input type="range" id="hit-offset" min="1" max="20" value="1">
+              <div class="range-val" id="hit-offset-val">1</div>
+            </div>
+            <div class="range">
+              <div class="range-label">期望状态</div>
+              <select id="hit-expect">
+                <option value="ON">ON</option>
+                <option value="OFF">OFF</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="btn-save-rules">保存规则</button>
+        <span class="msg" id="msg-rules"></span>
+      </div>
+      <div class="hint">
+        修改规则只影响未来区块，不补算历史；重启会清零计数器与运行态。
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>交易程序接入（WS 广播）</h2>
+      <div class="hint">
+        交易程序连接：<code>ws://&lt;host&gt;:8080/ws</code><br />
+        信号为极简 JSON：type=ON/OFF/HIT，height/baseHeight/state/time。
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
