@@ -63,6 +63,9 @@ type Config struct {
 
 	APIKeys []string `json:"apiKeys"`
 
+	// JudgeRule: LUCKY | BIGSMALL | ODDEVEN
+	JudgeRule string `json:"judgeRule"`
+
 	Rules Rules `json:"rules"`
 
 	Access AccessControl `json:"access"`
@@ -266,6 +269,7 @@ func loadConfig() (Config, error) {
 		if os.IsNotExist(err) {
 			// defaults
 			c.Access.Tokens = map[string]uint64{}
+			c.JudgeRule = "LUCKY"
 			return c, nil
 		}
 		return c, err
@@ -275,6 +279,10 @@ func loadConfig() (Config, error) {
 	}
 	if c.Access.Tokens == nil {
 		c.Access.Tokens = map[string]uint64{}
+	}
+	// default judge rule
+	if !isValidJudgeRule(c.JudgeRule) {
+		c.JudgeRule = "LUCKY"
 	}
 	return c, nil
 }
@@ -440,6 +448,79 @@ func loginPage(w http.ResponseWriter, r *http.Request) {
 </form>
 </body></html>`)
 }
+func externalGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// internal pages should already be protected by login; this is for external APIs if you want
+		cfgMu.RLock()
+		whitelist := append([]string(nil), cfg.Access.IPWhitelist...)
+		tokens := cfg.Access.Tokens
+		cfgMu.RUnlock()
+
+		ip := clientIP(r.RemoteAddr)
+		if ipAllowed(ip, whitelist) {
+			next(w, r)
+			return
+		}
+
+		// external must have token
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			token = r.Header.Get("X-Token")
+		}
+		if token == "" {
+			http.Error(w, "missing token", http.StatusUnauthorized)
+			return
+		}
+
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
+		if _, ok := tokens[token]; !ok {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		tokens[token]++
+		cfg.Access.Tokens = tokens
+		_ = saveConfigLocked(cfg)
+
+		next(w, r)
+	}
+}
+
+func clientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+func ipAllowed(ip string, whitelist []string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, entry := range whitelist {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// CIDR or single IP
+		if strings.Contains(entry, "/") {
+			_, netw, err := net.ParseCIDR(entry)
+			if err != nil {
+				continue
+			}
+			if netw.Contains(parsed) {
+				return true
+			}
+		} else {
+			if parsed.Equal(net.ParseIP(entry)) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func loginSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -459,20 +540,16 @@ func loginSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if u != web.Username {
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		http.Error(w, "invalid", http.StatusUnauthorized)
 		return
 	}
 	hash := sha256Hex(web.SaltHex + ":" + p)
 	if hash != web.HashHex {
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		http.Error(w, "invalid", http.StatusUnauthorized)
 		return
 	}
 
-	sid, err := randHex(24)
-	if err != nil {
-		http.Error(w, "rand failed", http.StatusInternalServerError)
-		return
-	}
+	sid, _ := randHex(16)
 	sessMu.Lock()
 	sessions[sid] = u
 	sessMu.Unlock()
@@ -484,121 +561,58 @@ func loginSubmit(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-
-	// login gate satisfied -> attempt start listener if keys available
-	tryStartListener()
-
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func logout(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("TSID")
-	if err == nil && c.Value != "" {
+	c, _ := r.Cookie("TSID")
+	if c != nil {
 		sessMu.Lock()
 		delete(sessions, c.Value)
 		sessMu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     "TSID",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
 	}
-	http.SetCookie(w, &http.Cookie{Name: "TSID", Value: "", Path: "/", MaxAge: -1})
 	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
-// ---------- Access control (optional; used for external HTTP only) ----------
-
-func ipAllowed(remoteAddr string, whitelist []string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, w := range whitelist {
-		w = strings.TrimSpace(w)
-		if w == "" {
-			continue
-		}
-		// exact match (simple)
-		if ip.String() == w {
-			return true
-		}
-	}
-	return false
-}
-
-func tokenOK(r *http.Request) (string, bool) {
-	tok := strings.TrimSpace(r.Header.Get("X-Token"))
-	if tok == "" {
-		tok = strings.TrimSpace(r.URL.Query().Get("token"))
-	}
-	if tok == "" {
-		return "", false
-	}
-	cfgMu.RLock()
-	_, ok := cfg.Access.Tokens[tok]
-	cfgMu.RUnlock()
-	return tok, ok
-}
-
-func externalGuard(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// internal pages should already be protected by login; this is for external APIs if you want
-		cfgMu.RLock()
-		whitelist := append([]string(nil), cfg.Access.IPWhitelist...)
-		cfgMu.RUnlock()
-
-		if ipAllowed(r.RemoteAddr, whitelist) {
-			next(w, r)
-			return
-		}
-
-		tok, ok := tokenOK(r)
-		if !ok {
-			http.Error(w, "token required", http.StatusUnauthorized)
-			return
-		}
-
-		cfgMu.Lock()
-		cfg.Access.Tokens[tok]++
-		_ = saveConfigLocked(cfg)
-		cfgMu.Unlock()
-
-		next(w, r)
-	}
-}
-
-// ---------- Web UI static ----------
+// ---------- Pages / Static ----------
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	// serve web/index.html
 	http.ServeFile(w, r, filepath.Join("web", "index.html"))
 }
 
-func staticHandler() http.Handler {
-	return http.StripPrefix("/", http.FileServer(http.Dir("./web")))
-}
-
-// ---------- API endpoints ----------
+// ---------- APIs ----------
 
 func apiStatus(w http.ResponseWriter, r *http.Request) {
 	rtMu.Lock()
-	defer rtMu.Unlock()
-
 	st := Status{
-		Listening:     rt.Listening,
-		LastHeight:    rt.LastHeight,
-		LastHash:      rt.LastHash,
-		LastTimeISO:   isoOrEmpty(rt.LastTime),
-		Reconnects:    atomic.LoadUint64(&reconnects),
-		ConnectedKeys: currentKeyCount(),
+		Listening:   rt.Listening,
+		LastHeight:  rt.LastHeight,
+		LastHash:    rt.LastHash,
+		LastTimeISO: isoOrEmpty(rt.LastTime),
+		Reconnects:  0,
 	}
+	rtMu.Unlock()
+
+	cfgMu.RLock()
+	st.ConnectedKeys = len(cfg.APIKeys)
+	cfgMu.RUnlock()
+
 	mustJSON(w, 200, st)
 }
 
 func apiGetAPIKeys(w http.ResponseWriter, r *http.Request) {
 	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	mustJSON(w, 200, map[string]any{"apiKeys": cfg.APIKeys})
+	keys := append([]string(nil), cfg.APIKeys...)
+	cfgMu.RUnlock()
+	mustJSON(w, 200, map[string]any{"apiKeys": keys})
 }
 
 func apiSetAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -606,98 +620,163 @@ func apiSetAPIKeys(w http.ResponseWriter, r *http.Request) {
 		APIKeys []string `json:"apiKeys"`
 	}
 	if err := readJSON(r, &req); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	keys := make([]string, 0, 3)
-	seen := map[string]struct{}{}
+	keys := make([]string, 0, len(req.APIKeys))
 	for _, k := range req.APIKeys {
 		k = strings.TrimSpace(k)
 		if k == "" {
 			continue
 		}
-		if _, ok := seen[k]; ok {
-			continue
-		}
-		seen[k] = struct{}{}
 		keys = append(keys, k)
-		if len(keys) >= 3 {
-			break
-		}
+	}
+	if len(keys) > 3 {
+		keys = keys[:3]
 	}
 
 	cfgMu.Lock()
 	cfg.APIKeys = keys
-	if err := saveConfigLocked(cfg); err != nil {
-		cfgMu.Unlock()
-		http.Error(w, "save failed", http.StatusInternalServerError)
-		return
-	}
+	_ = saveConfigLocked(cfg)
 	cfgMu.Unlock()
 
-	logger.Printf("APIKEYS_UPDATED count=%d", len(keys))
-
-	// hot-update listener start/stop
-	tryStartListener()
-	if len(keys) == 0 {
+	// start/stop listener depending on keys count
+	if len(keys) >= 1 {
+		tryStartListener()
+	} else {
 		stopListener()
 	}
 
-	mustJSON(w, 200, map[string]any{"ok": true, "apiKeys": keys})
+	logger.Printf("APIKEY_UPDATED count=%d", len(keys))
+	mustJSON(w, 200, map[string]any{"apiKeys": keys})
 }
 
 func apiGetRules(w http.ResponseWriter, r *http.Request) {
 	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	mustJSON(w, 200, cfg.Rules)
+	rules := cfg.Rules
+	cfgMu.RUnlock()
+	mustJSON(w, 200, rules)
 }
 
 func apiSetRules(w http.ResponseWriter, r *http.Request) {
-	var rr Rules
-	if err := readJSON(r, &rr); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+	var in Rules
+	if err := readJSON(r, &in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+
 	// sanitize
-	rr.On.Threshold = clamp(rr.On.Threshold, 0, 20)
-	rr.Off.Threshold = clamp(rr.Off.Threshold, 0, 20)
-	rr.Hit.Offset = clamp(rr.Hit.Offset, 1, 20)
-	rr.Hit.Expect = strings.ToUpper(strings.TrimSpace(rr.Hit.Expect))
-	if rr.Hit.Expect != "ON" && rr.Hit.Expect != "OFF" {
-		rr.Hit.Expect = "ON"
+	in.On.Threshold = clamp(in.On.Threshold, 0, 20)
+	in.Off.Threshold = clamp(in.Off.Threshold, 0, 20)
+
+	in.Hit.Offset = clamp(in.Hit.Offset, 1, 20)
+	in.Hit.Expect = strings.ToUpper(strings.TrimSpace(in.Hit.Expect))
+	if in.Hit.Expect != "ON" && in.Hit.Expect != "OFF" {
+		in.Hit.Expect = "ON"
 	}
 
 	cfgMu.Lock()
-	cfg.Rules = rr
-	if err := saveConfigLocked(cfg); err != nil {
-		cfgMu.Unlock()
-		http.Error(w, "save failed", http.StatusInternalServerError)
-		return
-	}
+	cfg.Rules = in
+	_ = saveConfigLocked(cfg)
 	cfgMu.Unlock()
 
-	logger.Printf("RULES_UPDATED on=(%v,%d) off=(%v,%d) hit=(%v,expect=%s,offset=%d)",
-		rr.On.Enabled, rr.On.Threshold, rr.Off.Enabled, rr.Off.Threshold, rr.Hit.Enabled, rr.Hit.Expect, rr.Hit.Offset)
+	logger.Printf("RULES_UPDATED on=%v/%d off=%v/%d hit=%v/x=%d/%s",
+		in.On.Enabled, in.On.Threshold,
+		in.Off.Enabled, in.Off.Threshold,
+		in.Hit.Enabled, in.Hit.Offset, in.Hit.Expect)
 
-	mustJSON(w, 200, map[string]any{"ok": true, "rules": rr})
+	mustJSON(w, 200, map[string]any{"ok": true})
 }
 
-// ---------- SSE status ----------
+func isValidJudgeRule(s string) bool {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "LUCKY", "BIGSMALL", "ODDEVEN":
+		return true
+	default:
+		return false
+	}
+}
+
+func apiGetJudge(w http.ResponseWriter, r *http.Request) {
+	cfgMu.RLock()
+	rule := cfg.JudgeRule
+	cfgMu.RUnlock()
+	if rule == "" {
+		rule = "LUCKY"
+	}
+	mustJSON(w, 200, map[string]any{"rule": rule})
+}
+
+func disableAllMachinesAndResetRuntimeLocked() {
+	// Stop all state machines: in this simplified single-machine version, that means disabling ON/OFF/HIT rules.
+	cfgMu.Lock()
+	cfg.Rules.On.Enabled = false
+	cfg.Rules.Off.Enabled = false
+	cfg.Rules.Hit.Enabled = false
+	_ = saveConfigLocked(cfg)
+	cfgMu.Unlock()
+
+	// Reset runtime counters/state
+	rtMu.Lock()
+	rt.OnCounter = 0
+	rt.OffCounter = 0
+	rt.WaitingReverse = true
+	rt.LastTriggered = ""
+	rt.BaseHeight = 0
+	rt.HitWaiting = false
+	rt.HitBase = 0
+	rt.HitOffset = 0
+	rt.HitExpect = ""
+	rt.HitArmedTime = time.Time{}
+	rtMu.Unlock()
+}
+
+func apiSetJudge(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Rule    string `json:"rule"`
+		Confirm bool   `json:"confirm"`
+		AckStop bool   `json:"ackStop"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	rule := strings.ToUpper(strings.TrimSpace(req.Rule))
+	if !isValidJudgeRule(rule) {
+		http.Error(w, "invalid rule", http.StatusBadRequest)
+		return
+	}
+	if !req.Confirm || !req.AckStop {
+		http.Error(w, "need confirm", http.StatusBadRequest)
+		return
+	}
+
+	cfgMu.Lock()
+	from := cfg.JudgeRule
+	if from == "" {
+		from = "LUCKY"
+	}
+	if from == rule {
+		cfgMu.Unlock()
+		mustJSON(w, 200, map[string]any{"ok": true, "rule": from})
+		return
+	}
+	cfg.JudgeRule = rule
+	_ = saveConfigLocked(cfg)
+	cfgMu.Unlock()
+
+	disableAllMachinesAndResetRuntimeLocked()
+
+	logger.Printf("SEV=MAJOR EVT=JUDGE_RULE_CHANGED FROM=%s TO=%s machinesStopped=true countersCleared=true", from, rule)
+	mustJSON(w, 200, map[string]any{"ok": true, "rule": rule})
+}
+
+// ---------- SSE ----------
 
 func sseStatus(w http.ResponseWriter, r *http.Request) {
-	if !isLoggedIn(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "no flusher", http.StatusInternalServerError)
-		return
-	}
 
 	ch := make(chan Status, 8)
 	sseMu.Lock()
@@ -708,251 +787,192 @@ func sseStatus(w http.ResponseWriter, r *http.Request) {
 		sseMu.Lock()
 		delete(sseSubs, ch)
 		sseMu.Unlock()
-		close(ch)
 	}()
 
 	// initial push
 	rtMu.Lock()
-	st := Status{
-		Listening:     rt.Listening,
-		LastHeight:    rt.LastHeight,
-		LastHash:      rt.LastHash,
-		LastTimeISO:   isoOrEmpty(rt.LastTime),
-		Reconnects:    atomic.LoadUint64(&reconnects),
-		ConnectedKeys: currentKeyCount(),
+	init := Status{
+		Listening:   rt.Listening,
+		LastHeight:  rt.LastHeight,
+		LastHash:    rt.LastHash,
+		LastTimeISO: isoOrEmpty(rt.LastTime),
 	}
 	rtMu.Unlock()
-	writeSSE(w, st)
-	flusher.Flush()
+	_, _ = fmt.Fprintf(w, "event: status\ndata: %s\n\n", mustMarshalJSON(init))
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
 
-	notify := r.Context().Done()
+	ctx := r.Context()
 	for {
 		select {
-		case <-notify:
+		case <-ctx.Done():
 			return
-		case s := <-ch:
-			writeSSE(w, s)
-			flusher.Flush()
+		case st := <-ch:
+			_, _ = fmt.Fprintf(w, "event: status\ndata: %s\n\n", mustMarshalJSON(st))
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 	}
 }
 
-func writeSSE(w io.Writer, st Status) {
-	b, _ := json.Marshal(st)
-	fmt.Fprintf(w, "event: status\n")
-	fmt.Fprintf(w, "data: %s\n\n", string(b))
+func mustMarshalJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
-func broadcastStatus() {
-	rtMu.Lock()
-	st := Status{
-		Listening:     rt.Listening,
-		LastHeight:    rt.LastHeight,
-		LastHash:      rt.LastHash,
-		LastTimeISO:   isoOrEmpty(rt.LastTime),
-		Reconnects:    atomic.LoadUint64(&reconnects),
-		ConnectedKeys: currentKeyCount(),
-	}
-	rtMu.Unlock()
-
+func pushSSE(st Status) {
 	sseMu.Lock()
 	defer sseMu.Unlock()
 	for ch := range sseSubs {
 		select {
 		case ch <- st:
 		default:
-			// drop if slow
 		}
 	}
 }
 
-// ---------- Block polling (listener) ----------
+// ---------- Listener (polling) ----------
 
 var (
-	listenerOnce  sync.Once
-	listenerStopC = make(chan struct{})
-	reconnects    uint64
+	listenMu  sync.Mutex
+	listenCtx context.Context
+	listenCan context.CancelFunc
 )
 
-func currentKeyCount() int {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	return len(cfg.APIKeys)
-}
-
 func tryStartListener() {
-	// start only if initialized+loggedIn gate satisfied (at least one active session) and keys>=1
 	cfgMu.RLock()
-	keysOK := len(cfg.APIKeys) >= 1
+	keysCount := len(cfg.APIKeys)
 	cfgMu.RUnlock()
-	if !keysOK {
-		return
-	}
-	// login gate: if any active session exists
-	sessMu.Lock()
-	hasSession := len(sessions) > 0
-	sessMu.Unlock()
-	if !hasSession {
+	if keysCount < 1 {
 		return
 	}
 
-	listenerOnce.Do(func() {
-		go listenerLoop()
-	})
-	// mark listening true (idempotent)
+	listenMu.Lock()
+	defer listenMu.Unlock()
+	if listenCan != nil {
+		return // already running
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	listenCtx = ctx
+	listenCan = cancel
+
 	rtMu.Lock()
 	rt.Listening = true
 	rtMu.Unlock()
-	broadcastStatus()
+
+	go listenerLoop(ctx)
+	logger.Println("LISTENER_START")
 }
 
 func stopListener() {
-	// we allow stop only by closing stop chan once.
-	// In this minimal version, we just set Listening=false; loop will observe keys==0 and idle.
+	listenMu.Lock()
+	defer listenMu.Unlock()
+	if listenCan != nil {
+		listenCan()
+		listenCan = nil
+	}
+
 	rtMu.Lock()
 	rt.Listening = false
 	rtMu.Unlock()
-	broadcastStatus()
+
+	logger.Println("LISTENER_STOP")
 }
 
-type tronNowBlockResp struct {
-	BlockID   string `json:"blockID"`
-	BlockHeader struct {
-		RawData struct {
-			Number    int64 `json:"number"`
-			Timestamp int64 `json:"timestamp"`
-		} `json:"raw_data"`
-	} `json:"block_header"`
-}
-
-func listenerLoop() {
-	logger.Println("LISTENER_LOOP_START")
-
+func listenerLoop(ctx context.Context) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	client := &http.Client{Timeout: 8 * time.Second}
-
 	for {
 		select {
-		case <-listenerStopC:
-			logger.Println("LISTENER_LOOP_STOP")
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			cfgMu.RLock()
 			keys := append([]string(nil), cfg.APIKeys...)
-			rules := cfg.Rules
 			cfgMu.RUnlock()
-
-			// if keys empty or no active session => not allowed to listen (gate)
-			sessMu.Lock()
-			hasSession := len(sessions) > 0
-			sessMu.Unlock()
-			if len(keys) == 0 || !hasSession {
-				rtMu.Lock()
-				rt.Listening = false
-				rtMu.Unlock()
-				continue
+			if len(keys) < 1 {
+				stopListener()
+				return
 			}
-			rtMu.Lock()
-			rt.Listening = true
-			rtMu.Unlock()
+			// simple round robin by time
+			idx := int(time.Now().UnixNano()) % len(keys)
+			apiKey := keys[idx]
 
-			// pick a key (round-robin by time)
-			key := keys[int(time.Now().UnixNano()%int64(len(keys)))]
-			height, hash, tISO, err := fetchNowBlock(client, defaultNodeURL, key)
+			height, hash, blockTime, err := fetchNowBlock(apiKey)
 			if err != nil {
-				atomic.AddUint64(&reconnects, 1)
-				logger.Printf("BLOCK_FETCH_ERROR: %v", err)
+				logger.Printf("POLL_ERROR: %v", err)
 				continue
 			}
 
-			// update status first (but still need dedupe)
 			rtMu.Lock()
 			rt.LastHeight = height
 			rt.LastHash = hash
-			rt.LastTime = parseISOOrNow(tISO)
+			rt.LastTime = blockTime
+			st := Status{
+				Listening:   rt.Listening,
+				LastHeight:  rt.LastHeight,
+				LastHash:    rt.LastHash,
+				LastTimeISO: isoOrEmpty(rt.LastTime),
+			}
 			rtMu.Unlock()
-			broadcastStatus()
+			pushSSE(st)
 
-			processBlock(height, hash, parseISOOrNow(tISO), rules)
+			// process block
+			processBlock(height, hash, blockTime)
 		}
 	}
 }
 
-func fetchNowBlock(client *http.Client, nodeURL, apiKey string) (height int64, hash string, timeISO string, err error) {
-	url := strings.TrimRight(nodeURL, "/") + "/wallet/getnowblock"
+func fetchNowBlock(apiKey string) (int64, string, time.Time, error) {
+	// POST /wallet/getnowblock
+	url := defaultNodeURL + "/wallet/getnowblock"
+
 	req, _ := http.NewRequest("POST", url, bytes.NewReader([]byte("{}")))
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
-		// TronGrid common header
 		req.Header.Set("TRON-PRO-API-KEY", apiKey)
 	}
 
+	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, "", "", err
+		return 0, "", time.Time{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return 0, "", "", fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return 0, "", time.Time{}, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
-	var out tronNowBlockResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, "", "", err
+	var out struct {
+		BlockID     string `json:"blockID"`
+		BlockHeader struct {
+			RawData struct {
+				Number    int64 `json:"number"`
+				Timestamp int64 `json:"timestamp"`
+			} `json:"raw_data"`
+		} `json:"block_header"`
 	}
-	height = out.BlockHeader.RawData.Number
-	hash = out.BlockID
-	ts := out.BlockHeader.RawData.Timestamp
-	// Tron returns ms timestamp
-	if ts > 0 {
-		timeISO = time.UnixMilli(ts).UTC().Format(time.RFC3339Nano)
-	} else {
-		timeISO = time.Now().UTC().Format(time.RFC3339Nano)
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 2<<20))
+	if err := dec.Decode(&out); err != nil {
+		return 0, "", time.Time{}, err
 	}
-	return
+	if out.BlockID == "" || out.BlockHeader.RawData.Number == 0 {
+		return 0, "", time.Time{}, errors.New("bad block data")
+	}
+
+	bt := time.UnixMilli(out.BlockHeader.RawData.Timestamp).UTC()
+	return out.BlockHeader.RawData.Number, out.BlockID, bt, nil
 }
+// ---------- Core: dedup + judge + state machine ----------
 
-// ---------- ON/OFF 判定（你已确认的映射表） ----------
-
-func blockStateByHash(hash string) (string, bool) {
-	hash = strings.ToLower(strings.TrimSpace(hash))
-	if len(hash) < 2 {
-		return "", false
-	}
-	a := hash[len(hash)-2]
-	b := hash[len(hash)-1]
-
-	t1, ok1 := hexCharType(a)
-	t2, ok2 := hexCharType(b)
-	if !ok1 || !ok2 {
-		return "", false
-	}
-
-	// 字母+数字 或 数字+字母 => ON；同类 => OFF
-	if t1 != t2 {
-		return "ON", true
-	}
-	return "OFF", true
-}
-
-func hexCharType(c byte) (string, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return "digit", true
-	case c >= 'a' && c <= 'f':
-		return "alpha", true
-	default:
-		return "", false
-	}
-}
-
-// ---------- Core processing pipeline ----------
-
-func processBlock(height int64, hash string, t time.Time, rules Rules) {
-	// Step 2: dedupe (height+hash)
+func processBlock(height int64, hash string, blockTime time.Time) {
+	// dedup
 	key := fmt.Sprintf("%d:%s", height, hash)
 
 	rtMu.Lock()
@@ -966,68 +986,159 @@ func processBlock(height int64, hash string, t time.Time, rules Rules) {
 	rt.Ring.add(key)
 	rtMu.Unlock()
 
-	// Step 3: judge ON/OFF
-	state, ok := blockStateByHash(hash)
+	// judge ON/OFF
+	state, ok := judgeState(hash)
 	if !ok {
-		logger.Printf("DROP_BLOCK_INVALID_HASH height=%d hash=%q", height, hash)
+		logger.Printf("JUDGE_FAIL height=%d hash=%s", height, hash)
 		return
 	}
 
-	// Step 4 + 5: state machine + optional hit
-	signals := evaluateStateMachine(height, state, t, rules)
+	cfgMu.RLock()
+	rules := cfg.Rules
+	cfgMu.RUnlock()
+
+	// state machine
+	signals := runStateMachine(height, state, blockTime, rules)
+
+	// broadcast signals
 	for _, s := range signals {
 		broadcastSignal(s)
 	}
 }
 
-func evaluateStateMachine(height int64, state string, t time.Time, rules Rules) []Signal {
+func judgeState(hash string) (string, bool) {
+	cfgMu.RLock()
+	rule := cfg.JudgeRule
+	cfgMu.RUnlock()
+	rule = strings.ToUpper(strings.TrimSpace(rule))
+	if rule == "" {
+		rule = "LUCKY"
+	}
+
+	switch rule {
+	case "BIGSMALL":
+		// last digit ignoring letters: 0-4 ON / 5-9 OFF
+		d, ok := lastDigit(hash)
+		if !ok {
+			logger.Printf("JUDGE_NO_DIGIT rule=BIGSMALL hash=%s", shrinkHash(hash))
+			return "", false
+		}
+		if d <= '4' {
+			return "ON", true
+		}
+		return "OFF", true
+
+	case "ODDEVEN":
+		// last digit ignoring letters: even ON / odd OFF
+		d, ok := lastDigit(hash)
+		if !ok {
+			logger.Printf("JUDGE_NO_DIGIT rule=ODDEVEN hash=%s", shrinkHash(hash))
+			return "", false
+		}
+		if ((d - '0') % 2) == 0 {
+			return "ON", true
+		}
+		return "OFF", true
+
+	case "LUCKY":
+		fallthrough
+	default:
+		// original: last two chars XOR type(letter/digit)
+		h := strings.ToLower(strings.TrimSpace(hash))
+		if len(h) < 2 {
+			return "", false
+		}
+		a := h[len(h)-2]
+		b := h[len(h)-1]
+		ta, oka := charType(a)
+		tb, okb := charType(b)
+		if !oka || !okb {
+			return "", false
+		}
+		if ta != tb {
+			return "ON", true
+		}
+		return "OFF", true
+	}
+}
+
+func shrinkHash(h string) string {
+	h = strings.TrimSpace(h)
+	if len(h) <= 13 {
+		return h
+	}
+	return h[:5] + "***" + h[len(h)-5:]
+}
+
+func lastDigit(hash string) (byte, bool) {
+	h := strings.TrimSpace(hash)
+	for i := len(h) - 1; i >= 0; i-- {
+		c := h[i]
+		if c >= '0' && c <= '9' {
+			return c, true
+		}
+	}
+	return 0, false
+}
+
+func charType(c byte) (string, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return "D", true
+	case c >= 'a' && c <= 'f':
+		return "A", true
+	default:
+		return "", false
+	}
+}
+
+func runStateMachine(height int64, state string, t time.Time, rules Rules) []Signal {
 	rtMu.Lock()
 	defer rtMu.Unlock()
 
-	// 初始状态：waitingReverse=true
-	// 为了让“解除等待”有明确反向：若从未触发过，则默认 LastTriggered="ON"（要求先看到 OFF 才开始计数）
-	if rt.LastTriggered == "" {
-		rt.LastTriggered = "ON"
-		rt.WaitingReverse = true
-	}
+	out := make([]Signal, 0, 2)
 
-	// Step 5: if hit waiting and reach t+x -> check once
-	var out []Signal
+	// HIT check first: only observe t+x once
 	if rt.HitWaiting && height == rt.HitBase+int64(rt.HitOffset) {
+		rt.HitWaiting = false
 		if state == rt.HitExpect {
-			out = append(out, Signal{
+			s := Signal{
 				Type:       "HIT",
 				Height:     height,
 				BaseHeight: rt.HitBase,
 				State:      state,
 				TimeISO:    t.UTC().Format(time.RFC3339Nano),
-			})
-			logger.Printf("HIT_SIGNAL height=%d base=%d state=%s", height, rt.HitBase, state)
+			}
+			out = append(out, s)
+			logger.Printf("HIT_SIGNAL base=%d height=%d state=%s", rt.HitBase, height, state)
 		} else {
-			logger.Printf("HIT_MISS height=%d base=%d got=%s expect=%s", height, rt.HitBase, state, rt.HitExpect)
+			logger.Printf("HIT_MISS base=%d height=%d got=%s expect=%s", rt.HitBase, height, state, rt.HitExpect)
 		}
-		// end hit regardless
-		rt.HitWaiting = false
 	}
 
-	// waitingReverse gate
+	// waitingReverse logic
 	if rt.WaitingReverse {
-		reverse := reverseOf(rt.LastTriggered)
-		if state == reverse {
+		if rt.LastTriggered == "" {
+			// initial: allow counting immediately
 			rt.WaitingReverse = false
-			// reset counters when unlock (clean start)
-			rt.OnCounter = 0
-			rt.OffCounter = 0
 		} else {
-			// still waiting, stop here
-			return out
+			rev := reverseOf(rt.LastTriggered)
+			if state == rev {
+				rt.WaitingReverse = false
+				// reset counters when reverse met
+				rt.OnCounter = 0
+				rt.OffCounter = 0
+			} else {
+				return out
+			}
 		}
 	}
 
-	// count stage
+	// counting per target rule
+	// Note: In this simplified version, we treat ON rule and OFF rule as two independent triggers,
+	// but only one can logically trigger depending on state sequences.
 	switch state {
 	case "ON":
-		// reset opposite
 		rt.OffCounter = 0
 		if rules.On.Enabled {
 			if state == "ON" {
@@ -1385,6 +1496,9 @@ func main() {
 	cfgMu.Lock()
 	cfg = loaded
 	// defaults
+	if !isValidJudgeRule(cfg.JudgeRule) {
+		cfg.JudgeRule = "LUCKY"
+	}
 	if cfg.Access.Tokens == nil {
 		cfg.Access.Tokens = map[string]uint64{}
 	}
@@ -1427,6 +1541,16 @@ func main() {
 			apiGetRules(w, r)
 		case "POST":
 			apiSetRules(w, r)
+		default:
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.HandleFunc("/api/judge", requireLogin(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			apiGetJudge(w, r)
+		case "POST":
+			apiSetJudge(w, r)
 		default:
 			http.Error(w, "method", http.StatusMethodNotAllowed)
 		}
