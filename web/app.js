@@ -69,6 +69,82 @@ async function loadRules() {
   $("hit-offset-val").textContent = $("hit-offset").value;
 }
 
+let currentJudgeRule = null;
+
+function judgeLabel(v) {
+  switch (v) {
+    case "LUCKY": return "幸运";
+    case "BIGSMALL": return "大小";
+    case "ODDEVEN": return "单双";
+    default: return v || "";
+  }
+}
+
+async function loadJudge() {
+  try {
+    const out = await apiGet("/api/judge");
+    currentJudgeRule = out.rule || "LUCKY";
+    if ($("judge-rule")) $("judge-rule").value = currentJudgeRule;
+  } catch (e) {
+    // ignore on older versions
+  }
+}
+
+function showJudgeModal(fromRule, toRule) {
+  const modal = $("judge-modal");
+  $("judge-modal-text").textContent =
+    `你将从【${judgeLabel(fromRule)}】切换到【${judgeLabel(toRule)}】。\n\n` +
+    `切换会立即中断所有状态机并清空计数器，且会自动停止（需手动重新启用）。`;
+  $("judge-ack").checked = false;
+  $("judge-confirm").disabled = true;
+  modal.classList.add("show");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function hideJudgeModal() {
+  const modal = $("judge-modal");
+  modal.classList.remove("show");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+async function applyJudgeRule() {
+  const toRule = $("judge-rule").value;
+  const fromRule = currentJudgeRule || "LUCKY";
+
+  if (toRule === fromRule) {
+    setMsg("msg-judge", "当前已是该判定规则", true);
+    return;
+  }
+
+  const ok1 = window.confirm("切换 ON/OFF 判定规则会立即中断所有状态机并清空计数器，并自动停止（需手动重新启用）。\n\n继续吗？");
+  if (!ok1) return;
+
+  showJudgeModal(fromRule, toRule);
+
+  const onAck = () => {
+    $("judge-confirm").disabled = !$("judge-ack").checked;
+  };
+  $("judge-ack").onchange = onAck;
+  onAck();
+
+  $("judge-cancel").onclick = () => hideJudgeModal();
+
+  $("judge-confirm").onclick = async () => {
+    try {
+      await apiPost("/api/judge", { rule: toRule, confirm: true, ackStop: true });
+      currentJudgeRule = toRule;
+      hideJudgeModal();
+      setMsg("msg-judge", `已切换为【${judgeLabel(toRule)}】，所有状态机已停止并清空计数器`, true);
+      // reload rules because backend will disable them
+      await loadRules();
+      await loadStatus();
+    } catch (e) {
+      hideJudgeModal();
+      setMsg("msg-judge", "切换失败: " + e.message, false);
+    }
+  };
+}
+
 async function saveRules() {
   const body = {
     on: {
@@ -130,9 +206,11 @@ function init() {
 
   $("btn-save-apikey").addEventListener("click", saveAPIKeys);
   $("btn-save-rules").addEventListener("click", saveRules);
+  if ($("judge-apply")) $("judge-apply").addEventListener("click", applyJudgeRule);
 
   loadAPIKeys();
   loadRules();
+  loadJudge();
   loadStatus();
   startSSE();
 

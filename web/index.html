@@ -59,6 +59,38 @@
     <section class="card">
       <h2>规则配置（全部使用滑块）</h2>
 
+      <div class="judge">
+        <div class="judge-head">
+          <div class="judge-title">ON/OFF 判定规则</div>
+          <div class="judge-note">切换会立即中断所有状态机并清空计数器，且会自动停止（需手动重新启用）。</div>
+        </div>
+        <div class="judge-body">
+          <select id="judge-rule" class="select">
+            <option value="LUCKY">幸运（现有）</option>
+            <option value="BIGSMALL">大小（0-4 ON / 5-9 OFF）</option>
+            <option value="ODDEVEN">单双（偶数 ON / 奇数 OFF）</option>
+          </select>
+          <button id="judge-apply" class="btn">确认切换</button>
+        </div>
+        <div class="msg" id="msg-judge"></div>
+      </div>
+
+      <!-- 二次确认弹窗 -->
+      <div class="modal" id="judge-modal" aria-hidden="true">
+        <div class="modal-card">
+          <div class="modal-title">最后确认</div>
+          <div class="modal-text" id="judge-modal-text"></div>
+          <label class="modal-check">
+            <input type="checkbox" id="judge-ack">
+            <span>我已理解：切换会停止所有状态机并清空计数器</span>
+          </label>
+          <div class="modal-actions">
+            <button class="btn ghost" id="judge-cancel">取消</button>
+            <button class="btn danger" id="judge-confirm" disabled>确认切换</button>
+          </div>
+        </div>
+      </div>
+
       <div class="rule">
         <div class="rule-head">
           <label class="switch">
